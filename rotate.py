@@ -85,6 +85,7 @@ def load_config() -> Dict[str, Any]:
         "RADIUS_FR_HUNTGROUPS_PATH": os.getenv("RADIUS_FR_HUNTGROUPS_PATH"),
         "RADIUS_FR_SITE_DEFAULT_PATH": os.getenv("RADIUS_FR_SITE_DEFAULT_PATH"),
         "RADIUS_FR_SERVICE": os.getenv("RADIUS_FR_SERVICE"),
+        "RADIUS_FR_MODE": os.getenv("RADIUS_FR_MODE"),  # 'virtual_server' (по умолчанию) или 'huntgroups'
         # Совместимость со старым скриптом (один префикс)
         "RADIUS_PREFIX": os.getenv("RADIUS_PREFIX"),
     }
@@ -115,6 +116,7 @@ def load_config() -> Dict[str, Any]:
     cfg.setdefault("RADIUS_FR_HUNTGROUPS_PATH", None)  # если None, возьмём по базе
     cfg.setdefault("RADIUS_FR_SITE_DEFAULT_PATH", None)
     cfg.setdefault("RADIUS_FR_SERVICE", "freeradius")
+    cfg.setdefault("RADIUS_FR_MODE", "virtual_server")
 
     # Приводим типы
     # Порты/числа
@@ -229,6 +231,9 @@ def validate_config(cfg: Dict[str, Any], check_db: bool = False) -> Tuple[bool, 
             has_selector = any(k in p for k in ("cidrs", "nas_identifier_regex", "called_station_regex"))
             if not has_selector:
                 errors.append(f"Политика #{idx}: не заданы условия (cidrs/nas_identifier_regex/called_station_regex)")
+    mode = str(cfg.get("RADIUS_FR_MODE", "virtual_server")).strip().lower()
+    if mode not in ("virtual_server", "huntgroups"):
+        errors.append("RADIUS_FR_MODE должен быть 'virtual_server' или 'huntgroups'")
 
     # Длины
     try:
@@ -717,23 +722,67 @@ def export_freeradius_config(cfg: Dict[str, Any], out: Optional[str]) -> int:
     if not policies:
         print("Нет политик для генерации. Задайте RADIUS_ENFORCE_PREFIX_ACCESS=1 и/или RADIUS_ACCESS_POLICIES в config.json")
         return 1
-    huntgroups_txt = render_huntgroups_text(policies)
-    unlang_txt = render_unlang_authorize_text(policies)
+    mode = str(cfg.get("RADIUS_FR_MODE", "virtual_server")).strip().lower()
 
-    if not out or out == "-":
-        print("=== HUNTGROUPS (merge into /etc/freeradius/3.0/huntgroups) ===")
-        print(huntgroups_txt)
-        print("=== UNLANG AUTHORIZE SNIPPET (sites-enabled/default:authorize) ===")
-        print(unlang_txt)
+    out_dir = None
+    if out and out != "-":
+        out_dir = pathlib.Path(out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    if mode == "huntgroups":
+        huntgroups_txt = render_huntgroups_text(policies)
+        unlang_txt = render_unlang_authorize_text(policies)
+        if not out or out == "-":
+            print("=== HUNTGROUPS (merge into /etc/freeradius/3.0/huntgroups) ===")
+            print(huntgroups_txt)
+            print("=== UNLANG AUTHORIZE SNIPPET (sites-enabled/default:authorize) ===")
+            print(unlang_txt)
+        else:
+            (out_dir / "huntgroups.radius-rotate").write_text(huntgroups_txt, encoding="utf-8")
+            (out_dir / "authorize.radius-rotate.snippet").write_text(unlang_txt, encoding="utf-8")
+            print(f"Сгенерировано: {out_dir / 'huntgroups.radius-rotate'}")
+            print(f"Сгенерировано: {out_dir / 'authorize.radius-rotate.snippet'}")
+            print("Подключите preprocess в authorize и вставьте сниппет после него.")
         return 0
 
-    out_dir = pathlib.Path(out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "huntgroups.radius-rotate").write_text(huntgroups_txt, encoding="utf-8")
-    (out_dir / "authorize.radius-rotate.snippet").write_text(unlang_txt, encoding="utf-8")
-    print(f"Сгенерировано: {out_dir / 'huntgroups.radius-rotate'}")
-    print(f"Сгенерировано: {out_dir / 'authorize.radius-rotate.snippet'}")
-    print("Подключите preprocess в authorize и вставьте сниппет после него.")
+    # virtual_server mode: по каждой политике создаём виртуальный сервер
+    def render_vs(pref: str, vsname: str) -> str:
+        pref_regex = ''.join(['\\' + c if c in "^$.|?*+()[]{}\\" else c for c in pref])
+        return (
+f"# radius-rotate virtual server for prefix '{pref}'\n"
+f"server {vsname} {{\n"
+f"    authorize {{\n"
+f"        if (&User-Name !~ /^{pref_regex}/) {{\n"
+f"            reject\n"
+f"        }}\n"
+f"        preprocess\n"
+f"        files\n"
+f"        sql\n"
+f"    }}\n"
+f"    authenticate {{\n"
+f"        Auth-Type PAP {{\n"
+f"            pap\n"
+f"        }}\n"
+f"    }}\n"
+f"}}\n")
+
+    if not out or out == "-":
+        for p in policies:
+            vsname = p["huntgroup"]
+            print(f"=== SITE {vsname} (sites-available/{vsname}) ===")
+            print(render_vs(p["prefix"], vsname))
+        print("Подключите клиентов к соответствующим виртуальным серверам (поле 'server' в таблице nas, read_clients=yes).")
+        return 0
+
+    # Вывод в каталог: создадим подкаталог sites-available
+    sa = out_dir / "sites-available"
+    sa.mkdir(parents=True, exist_ok=True)
+    for p in policies:
+        vsname = p["huntgroup"]
+        text = render_vs(p["prefix"], vsname)
+        (sa / vsname).write_text(text, encoding="utf-8")
+        print(f"Сгенерировано: {sa / vsname}")
+    print("Создано содержимое для sites-available/. Создайте symlink в sites-enabled/. И включите read_clients=yes в sql.")
     return 0
 
 def sudo_read_file(path: str) -> Optional[str]:
@@ -835,44 +884,114 @@ def import_freeradius_config(cfg: Dict[str, Any], restart: bool = False) -> int:
     if not policies:
         print("Нет политик для генерации. Включите RADIUS_ENFORCE_PREFIX_ACCESS и задайте политики.")
         return 1
-    huntgroups_txt = render_huntgroups_text(policies)
-    unlang_txt = render_unlang_authorize_text(policies)
-    hunt_path, site_def_path = freeradius_paths(cfg)
+    mode = str(cfg.get("RADIUS_FR_MODE", "virtual_server")).strip().lower()
 
-    # Резервные копии
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    hunt_bak = f"{hunt_path}.radius-rotate.bak.{ts}"
-    site_bak = f"{site_def_path}.radius-rotate.bak.{ts}"
+    if mode == "huntgroups":
+        huntgroups_txt = render_huntgroups_text(policies)
+        unlang_txt = render_unlang_authorize_text(policies)
+        hunt_path, site_def_path = freeradius_paths(cfg)
 
-    # Прочитаем текущий default
-    current_default = sudo_read_file(site_def_path)
-    if current_default is None:
-        print(f"Не удалось прочитать {site_def_path} (нужны права sudo)", file=sys.stderr)
-        return 2
-    new_default = inject_authorize_block(current_default, unlang_txt)
+        # Резервные копии
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        hunt_bak = f"{hunt_path}.radius-rotate.bak.{ts}"
+        site_bak = f"{site_def_path}.radius-rotate.bak.{ts}"
 
-    # Бэкапим и пишем
-    subprocess.run(["sudo", "cp", "-a", hunt_path, hunt_bak], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run(["sudo", "cp", "-a", site_def_path, site_bak], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        current_default = sudo_read_file(site_def_path)
+        if current_default is None:
+            print(f"Не удалось прочитать {site_def_path} (нужны права sudo)", file=sys.stderr)
+            return 2
+        new_default = inject_authorize_block(current_default, unlang_txt)
 
-    if not sudo_write_file(hunt_path, huntgroups_txt):
-        print("Не удалось записать huntgroups (sudo)", file=sys.stderr)
-        return 2
-    if not sudo_write_file(site_def_path, new_default):
-        print("Не удалось записать default (sudo)", file=sys.stderr)
-        return 2
+        subprocess.run(["sudo", "cp", "-a", hunt_path, hunt_bak], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["sudo", "cp", "-a", site_def_path, site_bak], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # Проверка конфигурации
+        if not sudo_write_file(hunt_path, huntgroups_txt):
+            print("Не удалось записать huntgroups (sudo)", file=sys.stderr)
+            return 2
+        if not sudo_write_file(site_def_path, new_default):
+            print("Не удалось записать default (sudo)", file=sys.stderr)
+            return 2
+
+        # Проверка конфигурации
+        res = subprocess.run(["sudo", "freeradius", "-XC"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if res.returncode != 0:
+            print("Ошибка проверки конфигурации:")
+            print(res.stdout)
+            subprocess.run(["sudo", "cp", "-a", hunt_bak, hunt_path])
+            subprocess.run(["sudo", "cp", "-a", site_bak, site_def_path])
+            return 1
+
+        print("Проверка конфигурации пройдена.")
+        if restart:
+            service = str(cfg.get("RADIUS_FR_SERVICE", "freeradius"))
+            r = subprocess.run(["sudo", "systemctl", "restart", service])
+            if r.returncode != 0:
+                print("Не удалось перезапустить службу.", file=sys.stderr)
+                return 1
+            print("Служба перезапущена.")
+        else:
+            print("Изменения записаны. Перезапустите службу FreeRADIUS, чтобы применить их.")
+        return 0
+
+    # virtual_server mode
+    base = str(cfg.get("RADIUS_FR_BASE", "/etc/freeradius/3.0"))
+    sa = os.path.join(base, "sites-available")
+    se = os.path.join(base, "sites-enabled")
+
+    # вспомогательные
+    def render_vs(pref: str, vsname: str) -> str:
+        pref_regex = ''.join(['\\' + c if c in "^$.|?*+()[]{}\\" else c for c in pref])
+        return (
+f"# radius-rotate virtual server for prefix '{pref}'\n"
+f"server {vsname} {{\n"
+f"    authorize {{\n"
+f"        if (&User-Name !~ /^{pref_regex}/) {{\n"
+f"            reject\n"
+f"        }}\n"
+f"        preprocess\n"
+f"        files\n"
+f"        sql\n"
+f"    }}\n"
+f"    authenticate {{\n"
+f"        Auth-Type PAP {{\n"
+f"            pap\n"
+f"        }}\n"
+f"    }}\n"
+f"}}\n")
+
+    # Удалим старые наши сайты, которых больше нет в политиках
+    try:
+        res = subprocess.run(["sudo", "ls", "-1", sa], capture_output=True, text=True)
+        existing = res.stdout.splitlines() if res.returncode == 0 else []
+    except Exception:
+        existing = []
+    current_names = {p["huntgroup"] for p in policies}
+    for fname in existing:
+        # Проверим маркер
+        path = os.path.join(sa, fname)
+        content = sudo_read_file(path) or ""
+        if content.startswith("# radius-rotate virtual server for prefix ") and fname not in current_names:
+            subprocess.run(["sudo", "rm", "-f", path])
+            subprocess.run(["sudo", "rm", "-f", os.path.join(se, fname)])
+
+    # Запишем/включим актуальные
+    for p in policies:
+        vsname = p["huntgroup"]
+        content = render_vs(p["prefix"], vsname)
+        if not sudo_write_file(os.path.join(sa, vsname), content):
+            print(f"Не удалось записать {sa}/{vsname}", file=sys.stderr)
+            return 2
+        # symlink в sites-enabled
+        subprocess.run(["sudo", "ln", "-sf", os.path.join(sa, vsname), os.path.join(se, vsname)])
+
+    # Проверим конфигурацию
     res = subprocess.run(["sudo", "freeradius", "-XC"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if res.returncode != 0:
         print("Ошибка проверки конфигурации:")
         print(res.stdout)
-        # Откат
-        subprocess.run(["sudo", "cp", "-a", hunt_bak, hunt_path])
-        subprocess.run(["sudo", "cp", "-a", site_bak, site_def_path])
         return 1
 
-    print("Проверка конфигурации пройдена.")
+    print("Проверка конфигурации пройдена. Включите в sql read_clients = yes и назначьте NAS.server для нужных клиентов.")
     if restart:
         service = str(cfg.get("RADIUS_FR_SERVICE", "freeradius"))
         r = subprocess.run(["sudo", "systemctl", "restart", service])
@@ -880,8 +999,6 @@ def import_freeradius_config(cfg: Dict[str, Any], restart: bool = False) -> int:
             print("Не удалось перезапустить службу.", file=sys.stderr)
             return 1
         print("Служба перезапущена.")
-    else:
-        print("Изменения записаны. Перезапустите службу FreeRADIUS, чтобы применить их.")
     return 0
 
 def list_usernames_by_prefix_from_password(cur, prefix: str) -> List[str]:
@@ -1137,6 +1254,7 @@ def nas_menu():
     policies = cfg.get("RADIUS_ACCESS_POLICIES") or []
     if not isinstance(policies, list):
         policies = []
+    mode = str(cfg.get("RADIUS_FR_MODE", "virtual_server")).strip().lower()
 
     def show_policies():
         if not policies:
@@ -1243,6 +1361,63 @@ def nas_menu():
             path = input("Каталог вывода (или '-' для консоли) [fr-conf]: ").strip() or "fr-conf"
             export_freeradius_config(cfg, path if path else None)
 
+    def assign_nas_servers():
+        # Назначение поля nas.server по политикам (виртуальный сервер = huntgroup)
+        if mode != "virtual_server":
+            print("Назначение NAS.server актуально только для режима 'virtual_server'.")
+            return
+        try:
+            conn = pymysql.connect(
+                host=cfg["RADIUS_DB_HOST"], port=int(cfg["RADIUS_DB_PORT"]), user=cfg["RADIUS_DB_USER"],
+                password=cfg["RADIUS_DB_PASS"], database=cfg["RADIUS_DB_NAME"], autocommit=False,
+                charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor
+            )
+        except Exception as e:
+            print("Не удалось подключиться к БД:", e)
+            return
+        updated = 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, nasname, shortname, server FROM nas")
+                rows = cur.fetchall() or []
+                def ip_in_policy(ip: str, pol: Dict[str, Any]) -> bool:
+                    try:
+                        ipaddr = ipaddress.ip_address(ip)
+                    except Exception:
+                        return False
+                    for net in pol.get("cidrs", []) or []:
+                        try:
+                            if ipaddr in ipaddress.ip_network(str(net), strict=False):
+                                return True
+                        except Exception:
+                            pass
+                    return False
+                def shortname_match(sn: str, pol: Dict[str, Any]) -> bool:
+                    for rx in pol.get("nas_identifier_regex", []) or []:
+                        try:
+                            if __import__("re").search(rx, sn or ""):
+                                return True
+                        except Exception:
+                            pass
+                    return False
+                for r in rows:
+                    target = None
+                    for p in policies:
+                        if ip_in_policy(str(r.get("nasname", "")), p) or shortname_match(str(r.get("shortname", "")), p):
+                            target = p.get("huntgroup")
+                            break
+                    if target and r.get("server") != target:
+                        print(f"NAS id={r['id']} {r['nasname']} shortname={r['shortname']} => server='{target}'")
+                        try:
+                            cur.execute("UPDATE nas SET server=%s WHERE id=%s", (target, r["id"]))
+                            updated += 1
+                        except Exception as e:
+                            print("Ошибка обновления NAS:", e)
+                conn.commit()
+        finally:
+            conn.close()
+        print(f"Назначено записей: {updated}")
+
     while True:
         print("\nМеню:")
         print(" 1) Показать политики")
@@ -1252,6 +1427,8 @@ def nas_menu():
         print(" 5) Добавить заготовки по префиксам")
         print(" 6) Переключить режим ENFORCE (сейчас: %s)" % ("ON" if cfg.get("RADIUS_ENFORCE_PREFIX_ACCESS") else "OFF"))
         print(" 7) Сохранить и сгенерировать конфиги")
+        print(" 8) Показать NAS из БД")
+        print(" 9) Массово назначить NAS.server по политикам")
         print(" q) Выход")
         choice = input("Выбор: ").strip().lower()
         if choice == "1":
@@ -1277,6 +1454,30 @@ def nas_menu():
             print("ENFORCE теперь:", "ON" if cfg["RADIUS_ENFORCE_PREFIX_ACCESS"] else "OFF")
         elif choice == "7":
             save_and_optionally_render()
+        elif choice == "8":
+            try:
+                conn = pymysql.connect(
+                    host=cfg["RADIUS_DB_HOST"], port=int(cfg["RADIUS_DB_PORT"]), user=cfg["RADIUS_DB_USER"],
+                    password=cfg["RADIUS_DB_PASS"], database=cfg["RADIUS_DB_NAME"], autocommit=True,
+                    charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor
+                )
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, nasname, shortname, server FROM nas ORDER BY id LIMIT 100")
+                    rows = cur.fetchall() or []
+                    if not rows:
+                        print("NAS не найдены.")
+                    else:
+                        for r in rows:
+                            print(f"[{r['id']}] nasname={r['nasname']} shortname={r['shortname']} server={r['server']}")
+            except Exception as e:
+                print("Ошибка чтения NAS:", e)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        elif choice == "9":
+            assign_nas_servers()
         elif choice == "q":
             return 0
         else:

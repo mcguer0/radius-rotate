@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Массовое создание и ротация пользователей FreeRADIUS/daloRADIUS по списку префиксов.
+Массовое создание и МЕСЯЧНАЯ ротация ПАРОЛЕЙ пользователей FreeRADIUS/daloRADIUS по списку префиксов.
 
-Возможности:
-- Для каждого заданного префикса создаёт одну новую учётку:
-    username = PREFIX + 32 символа [a-zA-Z0-9]
-    password = 64 символов [a-zA-Z0-9 + punctuation]
-    Expiration = через EXPIRE_MONTHS месяцев (локальное время сервера)
-- После создания удаляет все ПРОСРОЧЕННЫЕ учётки, чьи username начинаются с данных префиксов.
-  Удаление затрагивает: radcheck, radreply, radusergroup, userinfo. (radacct остаётся)
+Что делает теперь:
+- Не назначает срок годности (Expiration) и не удаляет пользователей.
+- Для каждого заданного префикса:
+  - При первом запуске создаёт нужное число учёток (COUNT_PER_PREFIX),
+    username = PREFIX + 32 символа [a-zA-Z0-9],
+    password = 64 символов [a-zA-Z0-9 + punctuation].
+  - При последующих запускax меняет пароль у ВСЕХ найденных учёток с этим префиксом.
+    (Опционально может дозаполнить недостающее количество до COUNT_PER_PREFIX.)
 
 Зависимости:
     pip install pymysql
@@ -22,8 +23,9 @@
     RADIUS_GROUP_NAME="default"
     RADIUS_FILL_USERINFO=1|0
     RADIUS_PASS_PUNCT="!#$%&()*+,-./:;<=>?@[]^_{|}~"   # опционально, чтобы исключить кавычки/бэкслеш и т.п.
-    RADIUS_EXPIRE_MONTHS=1
-    RADIUS_DELETE_EXPIRED=1|0   # включить/выключить удаление просроченных (по умолчанию 1)
+    RADIUS_COUNT_PER_PREFIX=1
+    RADIUS_USE_PREFIX=1|0
+    RADIUS_PREFIX_POSITION=start|end
 """
 
 import os
@@ -62,6 +64,8 @@ def load_config() -> Dict[str, Any]:
         "RADIUS_DB_PASS": os.getenv("RADIUS_DB_PASS"),
         "RADIUS_DB_NAME": os.getenv("RADIUS_DB_NAME"),
         "RADIUS_PREFIXES": os.getenv("RADIUS_PREFIXES"),
+        "RADIUS_USE_PREFIX": os.getenv("RADIUS_USE_PREFIX"),
+        "RADIUS_PREFIX_POSITION": os.getenv("RADIUS_PREFIX_POSITION"),
         "RADIUS_ENABLE_GROUP": os.getenv("RADIUS_ENABLE_GROUP"),
         "RADIUS_GROUP_NAME": os.getenv("RADIUS_GROUP_NAME"),
         "RADIUS_FILL_USERINFO": os.getenv("RADIUS_FILL_USERINFO"),
@@ -69,6 +73,8 @@ def load_config() -> Dict[str, Any]:
         "RADIUS_EXPIRE_MONTHS": os.getenv("RADIUS_EXPIRE_MONTHS"),
         "RADIUS_DELETE_EXPIRED": os.getenv("RADIUS_DELETE_EXPIRED"),
         "RADIUS_COUNT_PER_PREFIX": os.getenv("RADIUS_COUNT_PER_PREFIX"),
+        "RADIUS_USERNAME_TAIL_LEN": os.getenv("RADIUS_USERNAME_TAIL_LEN"),
+        "RADIUS_PASSWORD_LEN": os.getenv("RADIUS_PASSWORD_LEN"),
         # Совместимость со старым скриптом (один префикс)
         "RADIUS_PREFIX": os.getenv("RADIUS_PREFIX"),
     }
@@ -82,17 +88,21 @@ def load_config() -> Dict[str, Any]:
     cfg.setdefault("RADIUS_DB_USER", "username")
     cfg.setdefault("RADIUS_DB_PASS", "pass")
     cfg.setdefault("RADIUS_DB_NAME", "db")
+    cfg.setdefault("RADIUS_USE_PREFIX", True)
+    cfg.setdefault("RADIUS_PREFIX_POSITION", "start")  # start|end
     cfg.setdefault("RADIUS_ENABLE_GROUP", True)
     cfg.setdefault("RADIUS_GROUP_NAME", "default")
     cfg.setdefault("RADIUS_FILL_USERINFO", True)
     cfg.setdefault("RADIUS_PASS_PUNCT", None)
-    cfg.setdefault("RADIUS_EXPIRE_MONTHS", 1)
-    cfg.setdefault("RADIUS_DELETE_EXPIRED", True)
+    cfg.setdefault("RADIUS_EXPIRE_MONTHS", 1)  # более не используется для логики, оставлено для совместимости
+    cfg.setdefault("RADIUS_DELETE_EXPIRED", False)  # по-умолчанию не удаляем никого
     cfg.setdefault("RADIUS_COUNT_PER_PREFIX", 1)
+    cfg.setdefault("RADIUS_USERNAME_TAIL_LEN", 32)
+    cfg.setdefault("RADIUS_PASSWORD_LEN", 64)
 
     # Приводим типы
     # Порты/числа
-    for int_key in ("RADIUS_DB_PORT", "RADIUS_EXPIRE_MONTHS", "RADIUS_COUNT_PER_PREFIX"):
+    for int_key in ("RADIUS_DB_PORT", "RADIUS_EXPIRE_MONTHS", "RADIUS_COUNT_PER_PREFIX", "RADIUS_USERNAME_TAIL_LEN", "RADIUS_PASSWORD_LEN"):
         try:
             cfg[int_key] = int(cfg.get(int_key))
         except Exception:
@@ -107,7 +117,7 @@ def load_config() -> Dict[str, Any]:
         s = str(v).strip().lower()
         return s in ("1", "true", "yes", "y", "on")
 
-    for bkey in ("RADIUS_ENABLE_GROUP", "RADIUS_FILL_USERINFO", "RADIUS_DELETE_EXPIRED"):
+    for bkey in ("RADIUS_ENABLE_GROUP", "RADIUS_FILL_USERINFO", "RADIUS_DELETE_EXPIRED", "RADIUS_USE_PREFIX"):
         cfg[bkey] = to_bool(cfg.get(bkey))
 
     # Префиксы
@@ -156,14 +166,16 @@ def validate_config(cfg: Dict[str, Any], check_db: bool = False) -> Tuple[bool, 
         errors.append("DB name пустой")
 
     prefixes = cfg.get("RADIUS_PREFIXES", []) or []
-    if not isinstance(prefixes, list) or not prefixes:
-        errors.append("Список префиксов пустой")
-    else:
-        for p in prefixes:
-            if not str(p).strip():
-                errors.append("Обнаружен пустой префикс")
-            if any(ch.isspace() for ch in str(p)):
-                errors.append(f"Префикс содержит пробелы: '{p}'")
+    use_prefix = bool(cfg.get("RADIUS_USE_PREFIX", True))
+    if use_prefix:
+        if not isinstance(prefixes, list) or not prefixes:
+            errors.append("Список префиксов пустой")
+        else:
+            for p in prefixes:
+                if not str(p).strip():
+                    errors.append("Обнаружен пустой префикс")
+                if any(ch.isspace() for ch in str(p)):
+                    errors.append(f"Префикс содержит пробелы: '{p}'")
 
     try:
         cnt = int(cfg.get("RADIUS_COUNT_PER_PREFIX", 1))
@@ -172,12 +184,29 @@ def validate_config(cfg: Dict[str, Any], check_db: bool = False) -> Tuple[bool, 
     except Exception:
         errors.append("Кол-во аккаунтов на префикс должно быть числом")
 
+    # Срок действия более не используется, но валидируем мягко для обратной совместимости
     try:
-        months = int(cfg.get("RADIUS_EXPIRE_MONTHS", 1))
-        if months < 1 or months > 120:
-            errors.append("Срок действия (месяцев) должен быть в диапазоне 1..120")
+        _ = int(cfg.get("RADIUS_EXPIRE_MONTHS", 1))
     except Exception:
-        errors.append("Срок действия (месяцев) должен быть числом")
+        pass
+
+    # Длины
+    try:
+        name_tail = int(cfg.get("RADIUS_USERNAME_TAIL_LEN", 32))
+        if name_tail < 1 or name_tail > 128:
+            errors.append("Длина случайной части username должна быть 1..128")
+    except Exception:
+        errors.append("Длина username должна быть числом")
+    try:
+        pass_len = int(cfg.get("RADIUS_PASSWORD_LEN", 64))
+        if pass_len < 8 or pass_len > 256:
+            errors.append("Длина пароля должна быть 8..256")
+    except Exception:
+        errors.append("Длина пароля должна быть числом")
+
+    pos = str(cfg.get("RADIUS_PREFIX_POSITION", "start")).lower()
+    if pos not in ("start", "end"):
+        errors.append("Позиция префикса должна быть 'start' или 'end'")
 
     if str(cfg.get("RADIUS_ENABLE_GROUP", False)).lower() in ("true", "1") or bool(cfg.get("RADIUS_ENABLE_GROUP", False)):
         if not str(cfg.get("RADIUS_GROUP_NAME", "")).strip():
@@ -261,16 +290,34 @@ def interactive_config():
         cfg["RADIUS_DB_NAME"] = prompt("DB name", str(cfg.get("RADIUS_DB_NAME", "db")))
 
         # Префиксы
-        current_prefixes = cfg.get("RADIUS_PREFIXES", [])
-        pref_default = ",".join(current_prefixes) if current_prefixes else "wifi-"
-        pref_str = prompt("Префиксы (через запятую)", pref_default)
-        cfg["RADIUS_PREFIXES"] = [p.strip() for p in pref_str.split(",") if p.strip()]
+        use_pref = bool(cfg.get("RADIUS_USE_PREFIX", True))
+        use_pref = prompt_bool("Использовать префиксы в username", use_pref)
+        cfg["RADIUS_USE_PREFIX"] = use_pref
+        if use_pref:
+            current_prefixes = cfg.get("RADIUS_PREFIXES", [])
+            pref_default = ",".join(current_prefixes) if current_prefixes else "wifi-"
+            pref_str = prompt("Префиксы (через запятую)", pref_default)
+            cfg["RADIUS_PREFIXES"] = [p.strip() for p in pref_str.split(",") if p.strip()]
+            pos_default = str(cfg.get("RADIUS_PREFIX_POSITION", "start")).lower()
+            while True:
+                pos = input(f"Расположение префикса (start/end) [{pos_default}]: ").strip().lower() or pos_default
+                if pos in ("start", "end"):
+                    cfg["RADIUS_PREFIX_POSITION"] = pos
+                    break
+                print("Введите 'start' или 'end'.")
+        else:
+            cfg["RADIUS_PREFIXES"] = cfg.get("RADIUS_PREFIXES", [])  # оставим как есть/пусто
+            cfg["RADIUS_PREFIX_POSITION"] = str(cfg.get("RADIUS_PREFIX_POSITION", "start")).lower()
 
         # Количество создаваемых аккаунтов на каждый префикс
         cfg["RADIUS_COUNT_PER_PREFIX"] = prompt_int("Кол-во аккаунтов на префикс", int(cfg.get("RADIUS_COUNT_PER_PREFIX", 1)))
 
         # Время ротации (в месяцах)
         cfg["RADIUS_EXPIRE_MONTHS"] = prompt_int("Срок действия (месяцев)", int(cfg.get("RADIUS_EXPIRE_MONTHS", 1)))
+
+        # Длины
+        cfg["RADIUS_USERNAME_TAIL_LEN"] = prompt_int("Длина случайной части username", int(cfg.get("RADIUS_USERNAME_TAIL_LEN", 32)))
+        cfg["RADIUS_PASSWORD_LEN"] = prompt_int("Длина пароля", int(cfg.get("RADIUS_PASSWORD_LEN", 64)))
 
         # Прочие опции
         cfg["RADIUS_DELETE_EXPIRED"] = prompt_bool("Удалять просроченные", bool(cfg.get("RADIUS_DELETE_EXPIRED", True)))
@@ -321,6 +368,10 @@ CUSTOM_PUNCT = CFG.get("RADIUS_PASS_PUNCT")  # например "!#$%&()*+,-./:;
 EXPIRE_MONTHS = int(CFG.get("RADIUS_EXPIRE_MONTHS", 1))
 DELETE_EXPIRED = bool(CFG.get("RADIUS_DELETE_EXPIRED", True))
 COUNT_PER_PREFIX = int(CFG.get("RADIUS_COUNT_PER_PREFIX", 1))
+USE_PREFIX = bool(CFG.get("RADIUS_USE_PREFIX", True))
+PREFIX_POSITION = str(CFG.get("RADIUS_PREFIX_POSITION", "start")).lower()
+USERNAME_TAIL_LEN = int(CFG.get("RADIUS_USERNAME_TAIL_LEN", 32))
+PASSWORD_LEN = int(CFG.get("RADIUS_PASSWORD_LEN", 64))
 
 # Таблицы
 TBL_RADCHECK = "radcheck"
@@ -330,16 +381,25 @@ TBL_USERINFO = "userinfo"
 
 # ---------- УТИЛИТЫ ГЕНЕРАЦИИ ----------
 
-def random_username(prefix: str, tail_len: int = 32) -> str:
+def random_username(prefix: str, tail_len: int = None) -> str:
+    if tail_len is None:
+        tail_len = USERNAME_TAIL_LEN
     alphabet = string.ascii_letters + string.digits
-    return prefix + ''.join(secrets.choice(alphabet) for _ in range(tail_len))
+    tail = ''.join(secrets.choice(alphabet) for _ in range(tail_len))
+    if not USE_PREFIX:
+        return tail
+    if PREFIX_POSITION == "end":
+        return tail + prefix
+    return prefix + tail
 
-def random_password(length: int = 64) -> str:
+def random_password(length: int = None) -> str:
+    if length is None:
+        length = PASSWORD_LEN
     punctuation = CUSTOM_PUNCT if CUSTOM_PUNCT is not None else string.punctuation
     alphabet = string.ascii_letters + string.digits + punctuation
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-# ---------- ДАТЫ / EXPIRATION ----------
+# ---------- ДАТЫ / EXPIRATION (оставлено для совместимости с manage-меню) ----------
 
 def last_day_of_month(year: int, month: int) -> int:
     if month == 12:
@@ -418,7 +478,7 @@ def username_exists(cur, username: str) -> bool:
     cur.execute(f"SELECT 1 FROM {TBL_RADCHECK} WHERE username=%s LIMIT 1", (username,))
     return cur.fetchone() is not None
 
-def create_user(cur, prefix: str, expire_months: int) -> Tuple[str, str, str]:
+def create_user(cur, prefix: str, expire_months: int) -> Tuple[str, str, Optional[str]]:
     # генерируем уникальный username (на случай крайне редкой коллизии)
     for _ in range(5):
         username = random_username(prefix, 32)
@@ -428,18 +488,14 @@ def create_user(cur, prefix: str, expire_months: int) -> Tuple[str, str, str]:
         raise RuntimeError("Не удалось подобрать уникальный username за 5 попыток")
 
     password = random_password(64)
-    expiration_str = expiration_in_months(expire_months)
+    expiration_str = None  # больше не используем Expiration
 
     # Пароль
     cur.execute(
         f"INSERT INTO {TBL_RADCHECK} (username, attribute, op, value) VALUES (%s,'Cleartext-Password',':=',%s)",
         (username, password)
     )
-    # Expiration
-    cur.execute(
-        f"INSERT INTO {TBL_RADCHECK} (username, attribute, op, value) VALUES (%s,'Expiration',':=',%s)",
-        (username, expiration_str)
-    )
+    # Ранее здесь добавлялся атрибут Expiration — теперь не назначаем срок действия
 
     # Группа (опционально)
     if ENABLE_GROUP and GROUP_NAME:
@@ -486,6 +542,15 @@ def delete_user_everywhere(cur, username: str):
             # Таблицы может не быть (например, userinfo) — игнорируем
             pass
 
+def matches_prefix(username: str, prefix: str) -> bool:
+    if not isinstance(username, str):
+        return False
+    if not USE_PREFIX:
+        return False
+    if PREFIX_POSITION == "end":
+        return username.endswith(prefix)
+    return username.startswith(prefix)
+
 def collect_expired_usernames_for_prefix(cur, prefix: str) -> List[str]:
     """
     Ищем просроченные username для конкретного префикса.
@@ -500,7 +565,7 @@ def collect_expired_usernames_for_prefix(cur, prefix: str) -> List[str]:
     now_local = datetime.now()
     expired = []
     for uname, exp_val in rows:
-        if not isinstance(uname, str) or not uname.startswith(prefix):
+        if not matches_prefix(uname, prefix):
             continue
         if not isinstance(exp_val, (str, bytes)):
             continue
@@ -516,6 +581,40 @@ def collect_expired_usernames_for_prefix(cur, prefix: str) -> List[str]:
 
 # ---------- MAIN ----------
 
+def list_usernames_by_prefix_from_password(cur, prefix: str) -> List[str]:
+    """Возвращает список username, у которых есть атрибут Cleartext-Password и которые
+    соответствуют заданному префиксу (с учётом настроек USE_PREFIX/PREFIX_POSITION)."""
+    cur.execute(
+        f"SELECT username FROM {TBL_RADCHECK} WHERE attribute='Cleartext-Password'"
+    )
+    rows = cur.fetchall()
+    result: List[str] = []
+    for (uname,) in rows:
+        if matches_prefix(uname, prefix):
+            result.append(uname)
+    return result
+
+def set_user_password(cur, username: str, new_password: Optional[str] = None) -> str:
+    """Обновляет (или вставляет) Cleartext-Password для пользователя и возвращает пароль."""
+    if new_password is None:
+        new_password = random_password(64)
+    cur.execute(
+        f"SELECT id FROM {TBL_RADCHECK} WHERE username=%s AND attribute='Cleartext-Password' LIMIT 1",
+        (username,),
+    )
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            f"UPDATE {TBL_RADCHECK} SET value=%s WHERE username=%s AND attribute='Cleartext-Password'",
+            (new_password, username),
+        )
+    else:
+        cur.execute(
+            f"INSERT INTO {TBL_RADCHECK} (username, attribute, op, value) VALUES (%s,'Cleartext-Password',':=',%s)",
+            (username, new_password),
+        )
+    return new_password
+
 def list_users_by_prefix(cur, prefix: str) -> List[Tuple[str, str]]:
     cur.execute(
         f"SELECT username, value FROM {TBL_RADCHECK} WHERE attribute='Expiration'"
@@ -523,7 +622,7 @@ def list_users_by_prefix(cur, prefix: str) -> List[Tuple[str, str]]:
     rows = cur.fetchall()
     result: List[Tuple[str, str]] = []
     for uname, exp_val in rows:
-        if isinstance(uname, str) and uname.startswith(prefix):
+        if matches_prefix(uname, prefix):
             if isinstance(exp_val, bytes):
                 try:
                     exp_val = exp_val.decode("utf-8", "ignore")
@@ -557,8 +656,10 @@ def set_user_expiration(cur, username: str, months: int) -> str:
 
 def manage_menu():
     print("=== Управление пользователями по префиксам ===")
-    if not PREFIXES:
+    if not PREFIXES and USE_PREFIX:
         print("В конфигурации нет префиксов. Запустите -config для настройки.")
+    if not USE_PREFIX:
+        print("Внимание: в конфигурации отключено использование префикса — фильтрация по префиксу не работает.")
     try:
         conn = pymysql.connect(
             host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME,
@@ -788,9 +889,14 @@ def main():
     if any(arg in ("-schedule", "--schedule") for arg in sys.argv[1:]):
         sys.exit(schedule_menu())
 
-    if not PREFIXES:
-        print("ERROR: не задан ни один префикс. Укажите RADIUS_PREFIXES или RADIUS_PREFIX.", file=sys.stderr)
-        sys.exit(2)
+    if USE_PREFIX:
+        if not PREFIXES:
+            print("ERROR: не задан ни один префикс. Укажите RADIUS_PREFIXES или RADIUS_PREFIX.", file=sys.stderr)
+            sys.exit(2)
+        iter_prefixes = PREFIXES
+    else:
+        # Если префиксы не используются, всё равно выполним создание хотя бы один раз
+        iter_prefixes = PREFIXES if PREFIXES else [""]
 
     try:
         conn = pymysql.connect(
@@ -801,24 +907,28 @@ def main():
         print("ERROR: не удалось подключиться к БД:", e, file=sys.stderr)
         sys.exit(2)
 
-    created = []  # [(prefix, username, password, expiration)]
-    deleted = []  # [(prefix, username)]
+    created = []   # [(prefix, username, password)]
+    rotated = []   # [(prefix, username, new_password)]
 
     try:
         with conn.cursor() as cur:
-            # 1) Создание по каждому префиксу (возможность создать несколько)
-            for pref in PREFIXES:
-                for _ in range(max(1, COUNT_PER_PREFIX)):
-                    u, p, exp = create_user(cur, pref, EXPIRE_MONTHS)
-                    created.append((pref, u, p, exp))
-
-            # 2) Удаление просроченных по каждому префиксу
-            if DELETE_EXPIRED:
-                for pref in PREFIXES:
-                    to_del = collect_expired_usernames_for_prefix(cur, pref)
-                    for uname in to_del:
-                        delete_user_everywhere(cur, uname)
-                        deleted.append((pref, uname))
+            # Для каждого префикса: если есть существующие — меняем пароли всем.
+            # Если нет — создаём COUNT_PER_PREFIX новых.
+            for pref in iter_prefixes:
+                existing = list_usernames_by_prefix_from_password(cur, pref)
+                if existing:
+                    for uname in existing:
+                        new_pass = set_user_password(cur, uname)
+                        rotated.append((pref, uname, new_pass))
+                    # Доукомплектуем при необходимости до COUNT_PER_PREFIX
+                    if len(existing) < max(1, COUNT_PER_PREFIX):
+                        for _ in range(max(1, COUNT_PER_PREFIX) - len(existing)):
+                            u, p, _ = create_user(cur, pref, EXPIRE_MONTHS)
+                            created.append((pref, u, p))
+                else:
+                    for _ in range(max(1, COUNT_PER_PREFIX)):
+                        u, p, _ = create_user(cur, pref, EXPIRE_MONTHS)
+                        created.append((pref, u, p))
 
         conn.commit()
 
@@ -830,22 +940,20 @@ def main():
         conn.close()
 
     # --- РЕЗЮМЕ ---
-    print("=== Created users ===")
-    for pref, u, p, exp in created:
-        print(f"[{pref}]")
-        print(f"  Username  : {u}")
-        print(f"  Password  : {p}")
-        print(f"  Expires at: {exp} (local)")
-
-    if DELETE_EXPIRED:
-        print("\n=== Deleted expired users ===")
-        if not deleted:
-            print("  (none)")
-        else:
-            for pref, u in deleted:
-                print(f"  [{pref}] {u}")
-    else:
-        print("\nNOTE: Удаление просроченных отключено (RADIUS_DELETE_EXPIRED=0)")
+    # Резюме
+    if created:
+        print("=== Created users ===")
+        for pref, u, p in created:
+            print(f"[{pref}]")
+            print(f"  Username  : {u}")
+            print(f"  Password  : {p}")
+    if rotated:
+        print("\n=== Rotated passwords ===")
+        for pref, u, p in rotated:
+            print(f"[{pref}] {u}")
+            print(f"  New Password: {p}")
+    if not created and not rotated:
+        print("Нет действий: не найдено подходящих префиксов и настроек.")
 
 if __name__ == "__main__":
     main()
